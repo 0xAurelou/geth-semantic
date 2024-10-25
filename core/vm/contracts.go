@@ -138,6 +138,7 @@ var PrecompiledContractsPrague = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x12}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x13}): &bls12381MapG2{},
 	randomPRNGContractAddr:              &randomPRNG{},
+	randomNCSPRNGContractAddr:           &randomNCSPRNG{},
 }
 
 var PrecompiledContractsBLS = PrecompiledContractsPrague

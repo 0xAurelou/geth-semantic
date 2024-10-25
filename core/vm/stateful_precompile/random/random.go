@@ -44,6 +44,8 @@ var (
 	]`
 )
 
+var randomNCSPRNGContractAddr = common.HexToAddress("0x6942000000000000000000000000000000000000")
+
 func PackRandomNCSPRNGInput(n *big.Int) ([]byte, error) {
 	abi := contract.ParseABI(randomNCSPRNGABI)
 	return abi.Pack("randomNCSPRNG", n)
