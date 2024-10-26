@@ -1,123 +1,131 @@
-// (c) 2023, Ava Labs, Inc. All rights reserved.
-// See the file LICENSE for licensing terms.
-
-package random
+package vm
 
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/vm/stateful_precompile/contract"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
 
 const (
+	// RandomNCSPRNGGasCost is the base cost for the random number generation
 	RandomNCSPRNGGasCost = 1024
 )
 
 var (
 	errInvalidInputLength = errors.New("invalid input length")
-	randomNCSPRNGABI      = `[
-	  {
-		"type": "function",
-		"name": "randomNCSPRNG",
-		"inputs": [
-		  {
-			"name": "n",
-			"type": "uint256",
-			"internalType": "uint256"
-		  }
-		],
-		"outputs": [
-		  {
-			"name": "randomValues",
-			"type": "uint256[]",
-			"internalType": "uint256[]"
-		  }
-		],
-		"stateMutability": "view"
-	  }
-	]`
+	// RandomNCSPRNGContractAddr is the predefined address for the precompile
+	RandomNCSPRNGContractAddr = common.HexToAddress("0x6942000000000000000000000000000000000000")
 )
 
-var randomNCSPRNGContractAddr = common.HexToAddress("0x6942000000000000000000000000000000000000")
-
-func PackRandomNCSPRNGInput(n *big.Int) ([]byte, error) {
-	abi := contract.ParseABI(randomNCSPRNGABI)
-	return abi.Pack("randomNCSPRNG", n)
+// InputParams represents the decoded input parameters
+type randomInputParams struct {
+	caller common.Address
+	n      *big.Int
+	nonce  uint64
 }
 
-func UnpackRandomNCSPRNGInput(input []byte) (*big.Int, error) {
-	if len(input) != 32 {
+// RandomNCSPRNG implements the PrecompiledContract interface
+type randomNCSPRNG struct{}
+
+// RequiredGas returns the gas required to execute the pre-compiled contract
+func (r *randomNCSPRNG) RequiredGas(input []byte) uint64 {
+	return RandomNCSPRNGGasCost + uint64(len(input)/32)
+}
+
+// Run implements the required interface for PrecompiledContract
+func (r *randomNCSPRNG) Run(evm *EVM, input []byte) ([]byte, error) {
+	// Input format:
+	// [0:20]  - caller address
+	// [20:52] - n (big.Int, 32 bytes)
+	// [52:60] - nonce (uint64, 8 bytes)
+	if len(input) < 60 {
 		return nil, errInvalidInputLength
 	}
-	return new(big.Int).SetBytes(input), nil
+
+	params, err := decodeRandomInput(input)
+	if err != nil {
+		return nil, err
+	}
+
+	nUint256, overflow := uint256.FromBig(params.n)
+	if overflow {
+		return nil, errors.New("n overflows uint256")
+	}
+
+	randomValues, err := generateRandomNCSPRNG(
+		RandomNCSPRNGContractAddr,
+		params.caller,
+		*nUint256,
+		params.nonce,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return encodeRandomOutput(randomValues)
 }
 
-func PackRandomNCSPRNGOutput(randomValues []*big.Int) ([]byte, error) {
-	abi := contract.ParseABI(randomNCSPRNGABI)
-	return abi.Methods["randomNCSPRNG"].Outputs.Pack(randomValues)
+// decodeRandomInput extracts parameters from the input bytes
+func decodeRandomInput(input []byte) (*randomInputParams, error) {
+	caller := common.BytesToAddress(input[:20])
+	n := new(big.Int).SetBytes(input[20:52])
+	nonce := binary.BigEndian.Uint64(input[52:60])
+
+	return &randomInputParams{
+		caller: caller,
+		n:      n,
+		nonce:  nonce,
+	}, nil
 }
 
-func generateRandomNCSPRNG(precompileAddr common.Address, userAddr common.Address, n uint256.Int, state contract.StateDB) ([]*big.Int, error) {
+// encodeRandomOutput encodes the random values into bytes
+func encodeRandomOutput(randomValues []*big.Int) ([]byte, error) {
+	// Calculate total size: 32 bytes for length + 32 bytes per value
+	totalSize := 32 + (32 * len(randomValues))
+	output := make([]byte, totalSize)
+
+	// Encode length
+	binary.BigEndian.PutUint64(output[24:32], uint64(len(randomValues)))
+
+	// Encode values
+	for i, value := range randomValues {
+		offset := 32 + (i * 32)
+		bytes := value.FillBytes(make([]byte, 32))
+		copy(output[offset:offset+32], bytes)
+	}
+
+	return output, nil
+}
+
+// generateRandomNCSPRNG generates random numbers using HMAC-SHA256
+func generateRandomNCSPRNG(precompileAddr common.Address, userAddr common.Address, n uint256.Int, nonce uint64) ([]*big.Int, error) {
 	serverSeed := crypto.Keccak256(precompileAddr.Bytes())
 	userSeed := crypto.Keccak256(append(userAddr.Bytes(), serverSeed...))
-	nonce := state.GetNonce(userAddr)
 
 	randomValues := make([]*big.Int, n.Uint64())
 	hmac := hmac.New(sha256.New, serverSeed)
+
 	for i := uint64(0); i < n.Uint64(); i++ {
 		hmac.Reset()
 		hmac.Write(userSeed)
-		hmac.Write(common.BigToHash(new(big.Int).SetUint64(nonce)).Bytes())
-		hmac.Write(common.BigToHash(new(big.Int).SetUint64(i)).Bytes())
+
+		nonceBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(nonceBytes, nonce)
+		hmac.Write(nonceBytes)
+
+		countBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(countBytes, i)
+		hmac.Write(countBytes)
+
 		hash := hmac.Sum(nil)
 		randomValues[i] = new(big.Int).SetBytes(hash)
 	}
 
 	return randomValues, nil
-}
-
-func RandomNCSPRNGFunc(accessibleState contract.AccessibleState, caller common.Address, addr common.Address, input []byte, suppliedGas uint64, readOnly bool) (ret []byte, remainingGas uint64, err error) {
-	if remainingGas, err = contract.DeductGas(suppliedGas, RandomNCSPRNGGasCost); err != nil {
-		return nil, 0, err
-	}
-
-	n, err := UnpackRandomNCSPRNGInput(input)
-	if err != nil {
-		return nil, remainingGas, err
-	}
-
-	nUint256, overflow := uint256.FromBig(n)
-	if overflow {
-		return nil, remainingGas, errors.New("n overflows uint256")
-	}
-
-	randomValues, err := generateRandomNCSPRNG(addr, caller, *nUint256, accessibleState.GetStateDB())
-	if err != nil {
-		return nil, remainingGas, err
-	}
-
-	ret, err = PackRandomNCSPRNGOutput(randomValues)
-	if err != nil {
-		return nil, remainingGas, err
-	}
-
-	return ret, remainingGas, nil
-}
-
-// CreateRandomNCSPRNGPrecompile returns a StatefulPrecompiledContract with randomNCSPRNG function
-func CreateRandomNCSPRNGPrecompile() contract.StatefulPrecompiledContract {
-	abi := contract.ParseABI(randomNCSPRNGABI)
-
-	randomNCSPRNGFunction := contract.NewStatefulPrecompileFunction(abi.Methods["randomNCSPRNG"].ID, RandomNCSPRNGFunc)
-	contract, err := contract.NewStatefulPrecompileContract(nil, []*contract.StatefulPrecompileFunction{randomNCSPRNGFunction})
-	if err != nil {
-		panic(err)
-	}
-	return contract
 }
